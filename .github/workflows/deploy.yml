@@ -1,0 +1,167 @@
+name: 'Reusable Deploy Pipeline'
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+
+jobs:
+  linting:
+    name: Linting
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        tool: [pip-audit, yapf, pylint, jsonlint]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: '3.12'
+
+      - name: Run ${{ matrix.tool }}
+        run: |
+          if [[ "${{ matrix.tool }}" == "pip-audit" ]]; then
+              pip install pip-audit
+              pip-audit -f json | python -m json.tool
+          elif [[ "${{ matrix.tool }}" == "yapf" ]]; then
+              pip install yapf
+              yapf --recursive --style=google .
+          elif [[ "${{ matrix.tool }}" == "pylint" ]]; then
+              pip install pylint
+              pylint --recursive=y --max-line-length=80 --disable=import-error .
+          elif [[ "${{ matrix.tool }}" == "jsonlint" ]]; then
+              sudo apt-get install -y jq
+              find . -name '*.json' -print0 | xargs -0 -n1 jq empty
+          fi
+
+  deploy:
+    name: Initialize, Setup, Validate, Plan, and Deploy
+    needs: linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        if: ${{ success() }}
+
+      - name: Run Configure Backend
+        run: ./configure-backend.sh ${{ inputs.environment }}
+        if: ${{ success() }}
+
+      - name: cat backend
+        run: cat backend.tf
+        
+      - name: Echo terraform.tfvars.json
+        run: echo "terraform.tfvars.json contents:"
+        
+      - name: cat terraform.tfvars.json
+        run: cat terraform.tfvars.json
+
+      - name: Generate AWS IAM ARN variable
+        shell: bash
+        if: ${{ success() }}
+        run: |
+          ACCOUNT=$(jq -r ".${{ inputs.environment }}" terraform.tfvars.json)
+          ARN="arn:aws:iam::${ACCOUNT}:role/github-actions"
+          echo "AWS_ARN=${ARN}" >> $GITHUB_ENV
+      
+      - name: Use AWS ARN
+        run: echo "The AWS ARN is ${{ env.AWS_ARN }}"
+        if: ${{ success() }}
+        
+      - name: Configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ARN }}
+          aws-region: us-east-1
+        if: ${{ success() }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: latest
+
+      - name: Terraform Init
+        run: terraform init
+        if: ${{ success() }}
+
+      - name: Terraform Validate
+        run: terraform validate
+        if: ${{ success() }}
+
+      - name: List
+        run: ls -lah
+        if: ${{ success() }}
+
+      - name: Gather variable files
+        id: gather-vars
+        run: |
+          VAR_FILES=$(find . -maxdepth 1 -type f \( -name "*.tfvars" -o -name "*.tfvars.json" \) | awk '{printf "-var-file=%s ", $1}')
+          echo "VAR_FILES=$VAR_FILES" >> $GITHUB_ENV
+          echo "Found variable files: $VAR_FILES"
+        if: ${{ success() }}
+
+      - name: Terraform Plan with Dynamic Variable Files
+        run: |
+          TF_LOG=DEBUG
+          echo "Running: terraform plan $VAR_FILES"
+          terraform plan $VAR_FILES
+        if: ${{ success() }}
+        
+      - name: Terraform Apply
+        run: |
+          TF_LOG=DEBUG
+          terraform apply -auto-approve $VAR_FILES
+
+  destroyo:
+    name: Destroy Dev
+    if: ${{ inputs.environment == 'prod' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+  
+      - name: Generate AWS IAM ARN variable for dev account
+        shell: bash
+        run: |
+          # Query the dev account from terraform.tfvars.json
+          ACCOUNT=$(jq -r '.dev' terraform.tfvars.json)
+          if [ -z "$ACCOUNT" ]; then
+            echo "Error: Could not retrieve dev account from terraform.tfvars.json"
+            exit 1
+          fi
+          ARN="arn:aws:iam::${ACCOUNT}:role/github-actions"
+          echo "AWS_ARN=${ARN}" >> $GITHUB_ENV
+          echo "Using dev account: $ACCOUNT"
+  
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ARN }}
+          aws-region: us-east-1
+  
+      - name: Run Configure Backend for dev
+        run: ./configure-backend.sh "dev"
+  
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: latest
+  
+      - name: Terraform Init
+        run: terraform init
+  
+      - name: Gather variable files
+        id: gather-vars-destroy
+        run: |
+          VAR_FILES=$(find . -maxdepth 1 -type f \( -name "*.tfvars" -o -name "*.tfvars.json" \) | awk '{printf "-var-file=%s ", $1}')
+          echo "VAR_FILES=$VAR_FILES" >> $GITHUB_ENV
+          echo "Found variable files: $VAR_FILES"
+    
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve $VAR_FILES
+  
